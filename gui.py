@@ -17,6 +17,7 @@ Se importa y se lanza desde main.py; también puede correrse solo
 (`python gui.py`) para pruebas rápidas de la interfaz.
 """
 
+import math
 import warnings
 from tkinter import filedialog, messagebox
 from typing import Optional
@@ -25,6 +26,7 @@ import customtkinter as ctk
 import numpy as np
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.patches import Polygon, Rectangle
 
 from engine import (
     ArduinoDataError,
@@ -58,6 +60,16 @@ COLOR_POTENCIA = "#6A4C93"     # violeta
 COLOR_CRUDO = "#B0B0B0"        # gris claro (datos crudos, dispersión)
 COLOR_AVISO = "#D68910"        # ámbar oscuro (texto de advertencia)
 
+# --- Animación del péndulo ---
+FPS_ANIMACION = 30             # cuadros por segundo del temporizador de playback
+L_VARILLA = 1.0                # longitud VISUAL de la varilla (unidades del eje)
+VELOCIDADES_ANIMACION = {      # factor de cámara lenta (1x = tiempo real del ensayo)
+    "0.1x": 0.1,
+    "0.25x": 0.25,
+    "0.5x": 0.5,
+    "1x": 1.0,
+}
+
 
 class CharpyApp(ctk.CTk):
     """Ventana principal del Analizador de Ensayo Charpy."""
@@ -79,6 +91,10 @@ class CharpyApp(ctk.CTk):
 
         self._construir_panel_lateral()
         self._construir_panel_graficos()
+
+        # Un 'after' de la animación pendiente no debe disparar contra widgets
+        # ya destruidos: corta el temporizador antes de cerrar la ventana.
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
 
     # ================================================================
     # PANEL LATERAL (carga + parámetros + resultados)
@@ -259,6 +275,7 @@ class CharpyApp(ctk.CTk):
         tab_vel = self.tabview.add("Velocidad")
         tab_acel = self.tabview.add("Aceleración")
         tab_energia = self.tabview.add("Energía y potencia")
+        tab_anim = self.tabview.add("Animación")
 
         self.fig_angulo, self.ax_angulo, self.canvas_angulo = self._crear_figura(tab_angulo)
         self.fig_vel, self.ax_vel, self.canvas_vel = self._crear_figura(tab_vel)
@@ -284,6 +301,17 @@ class CharpyApp(ctk.CTk):
         self.canvas_vel.draw()
         self.canvas_acel.draw()
         self.canvas_energia.draw()
+
+        self._construir_tab_animacion(tab_anim)
+
+        # Pausa el playback cuando se sale de la pestaña de animación. Se
+        # configura DESPUÉS de construir la pestaña para que _anim_pausar()
+        # siempre encuentre sus widgets. CTkTabview llama al command sin
+        # argumentos, por eso se consulta la pestaña actual con .get().
+        try:
+            self.tabview.configure(command=self._cambiar_pestania)
+        except Exception:
+            pass  # versiones de CustomTkinter sin callback de pestaña
 
     def _crear_figura(self, tab_frame):
         fig = Figure(figsize=(6, 5), dpi=100)
@@ -349,6 +377,9 @@ class CharpyApp(ctk.CTk):
         self.btn_exportar.configure(state="disabled")
         self.lbl_resultado.configure(text="Datos cargados. Ajustá los parámetros y presioná Calcular.")
         self.lbl_aviso.configure(text="")
+
+        # Un archivo nuevo invalida la animación del ensayo anterior.
+        self._anim_limpiar()
 
     # ================================================================
     # VALIDACION DE CAMPOS
@@ -535,6 +566,329 @@ class CharpyApp(ctk.CTk):
 
         self.fig_energia.tight_layout(pad=3.0)
         self.canvas_energia.draw()
+
+        # La pestaña de animación se rearma con el mismo spline ya calculado.
+        self._preparar_animacion(r)
+
+    # ================================================================
+    # ANIMACION DEL PENDULO (pestaña "Animación")
+    # ================================================================
+    def _construir_tab_animacion(self, tab):
+        """Arma la pestaña que reproduce el movimiento del péndulo del ensayo,
+        sincronizado con un cursor sobre la curva de ángulo.
+
+        No hay física nueva acá: la pose del péndulo en cada instante sale del
+        mismo spline que ya calculó engine.py (angulo_suavizado_grados sobre
+        tiempo_s), igual que las curvas de las otras pestañas.
+        """
+        # --- Barra de controles (abajo del todo) ---
+        barra = ctk.CTkFrame(tab, fg_color="transparent")
+        barra.pack(side="bottom", fill="x", pady=(8, 0))
+
+        self.btn_anim_play = ctk.CTkButton(
+            barra, text="▶  Reproducir", width=130, state="disabled",
+            command=self._anim_toggle, fg_color=COLOR_ACCENT, hover_color="#246a87",
+        )
+        self.btn_anim_play.pack(side="left", padx=(0, 6))
+
+        self.btn_anim_reset = ctk.CTkButton(
+            barra, text="↺  Reiniciar", width=110, state="disabled",
+            command=self._anim_reiniciar, fg_color="#555555", hover_color="#3d3d3d",
+        )
+        self.btn_anim_reset.pack(side="left", padx=(0, 16))
+
+        ctk.CTkLabel(barra, text="Velocidad:", font=ctk.CTkFont(size=12)).pack(
+            side="left", padx=(0, 6)
+        )
+        self.opt_anim_velocidad = ctk.CTkOptionMenu(
+            barra, values=list(VELOCIDADES_ANIMACION.keys()), width=90,
+            command=self._anim_cambiar_velocidad,
+        )
+        self.opt_anim_velocidad.set("0.25x")
+        self.opt_anim_velocidad.pack(side="left")
+
+        self.lbl_anim_info = ctk.CTkLabel(
+            barra, text="", font=ctk.CTkFont(size=11), text_color=("gray40", "gray60"),
+        )
+        self.lbl_anim_info.pack(side="right")
+
+        # --- Figura: péndulo (izq.) + ángulo vs. tiempo (der.) ---
+        self.fig_anim = Figure(figsize=(6, 5), dpi=100)
+        self.ax_pend = self.fig_anim.add_subplot(121)
+        self.ax_anim_curva = self.fig_anim.add_subplot(122)
+        self.fig_anim.tight_layout(pad=3.0)
+        self.canvas_anim = FigureCanvasTkAgg(self.fig_anim, master=tab)
+        self.canvas_anim.get_tk_widget().pack(fill="both", expand=True)
+
+        # --- Estado del playback ---
+        self._anim_t = 0.0                 # instante de dato que se muestra (s)
+        self._anim_t_fin = 0.0
+        self._anim_t_malla = None          # malla temporal del spline
+        self._anim_angulo = None           # ángulo suavizado (grados)
+        self._anim_vel_rad = None          # velocidad angular del spline (rad/s)
+        self._anim_theta_prev = None       # para detectar el cruce por cero
+        self._anim_flash = 0               # cuadros que dura el destello de impacto
+        self._anim_playing = False
+        self._anim_gen = 0                 # invalida ticks de reproducciones viejas
+        self._anim_after_id = None
+        self._anim_velocidad = VELOCIDADES_ANIMACION["0.25x"]
+
+        self._anim_placeholder()
+
+    def _anim_placeholder(self):
+        """Estado inicial: todavía no hay ningún resultado que animar."""
+        self.ax_pend.clear()
+        self.ax_pend.axis("off")
+        self.ax_pend.text(
+            0.5, 0.5,
+            "Cargá un archivo y presioná Calcular\npara ver la animación del péndulo.",
+            ha="center", va="center", fontsize=11, color="gray",
+            transform=self.ax_pend.transAxes,
+        )
+        self.ax_anim_curva.clear()
+        self.ax_anim_curva.axis("off")
+        self.canvas_anim.draw()
+
+    def _cambiar_pestania(self):
+        """CTkTabview llama a esto SIN argumentos al cambiar de pestaña, así
+        que la pestaña activa se consulta con .get()."""
+        if self.tabview.get() != "Animación":
+            self._anim_pausar()
+
+    # ----------------------------------------------------------------
+    # Preparación (una vez por cada Calcular)
+    # ----------------------------------------------------------------
+    def _preparar_animacion(self, r: ResultadoAnalisis):
+        """Deja la pestaña lista para el resultado r y dibuja el cuadro t=0."""
+        self._anim_pausar()
+
+        self._anim_t_malla = np.asarray(r.tiempo_s, dtype=float)
+        self._anim_angulo = np.asarray(r.angulo_suavizado_grados, dtype=float)
+        self._anim_vel_rad = np.asarray(r.velocidad_angular_rad_s, dtype=float)
+        self._anim_t = float(self._anim_t_malla[0])
+        self._anim_t_fin = float(self._anim_t_malla[-1])
+        self._anim_theta_prev = None
+        self._anim_flash = 0
+
+        self._dibujar_pendulo_estatico(r)
+        self._dibujar_curva_estatica(r)
+
+        self.btn_anim_play.configure(state="normal", text="▶  Reproducir")
+        self.btn_anim_reset.configure(state="normal")
+        self.fig_anim.tight_layout(pad=3.0)
+        self._dibujar_frame_anim()
+
+    def _dibujar_pendulo_estatico(self, r: ResultadoAnalisis):
+        """Marco fijo del péndulo: pivote, referencia vertical, posición de
+        liberación y probeta. Las piezas móviles se crean acá vacías y se
+        actualizan cuadro a cuadro en _dibujar_frame_anim()."""
+        ax = self.ax_pend
+        ax.clear()
+        ax.axis("on")
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlim(-1.25, 1.25)
+        ax.set_ylim(-1.25, 1.25)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for lado in ("top", "right", "bottom", "left"):
+            ax.spines[lado].set_visible(False)
+
+        # Referencia vertical: theta = 0 (punto más bajo, donde va la probeta).
+        ax.plot([0, 0], [-1.25, 0.0], color="#CCCCCC", linewidth=1,
+                linestyle=":", zorder=1)
+
+        # Posición de liberación (el ángulo inicial que usó el cálculo).
+        rad_ini = math.radians(r.angulo_inicial_usado_grados)
+        ax.plot([0, L_VARILLA * math.sin(rad_ini)],
+                [0, -L_VARILLA * math.cos(rad_ini)],
+                color="#CCCCCC", linewidth=1, linestyle="--", zorder=1)
+
+        # Probeta: bloque gris en el punto más bajo.
+        self._anim_probeta = Rectangle(
+            (-0.17, -1.08), 0.34, 0.13,
+            facecolor="#8a8a8a", edgecolor="#5a5a5a", linewidth=1, zorder=2,
+        )
+        ax.add_patch(self._anim_probeta)
+
+        # Pivote, varilla y martillo (el martillo es un polígono que se reorienta).
+        ax.plot([0], [0], marker="o", markersize=6, color=COLOR_TOTAL, zorder=6)
+        self._anim_varilla, = ax.plot([], [], color=COLOR_TOTAL, linewidth=3, zorder=5)
+        self._anim_martillo = Polygon(
+            [(0.0, 0.0)] * 4, closed=True, facecolor=COLOR_ACCENT,
+            edgecolor="#1c5670", linewidth=1, zorder=5,
+        )
+        ax.add_patch(self._anim_martillo)
+
+    def _dibujar_curva_estatica(self, r: ResultadoAnalisis):
+        """Curva de ángulo del spline con las líneas de liberación y rebote, más
+        el cursor y el punto que se mueven en cada cuadro."""
+        ax = self.ax_anim_curva
+        ax.clear()
+        ax.axis("on")
+        t_ms = self._anim_t_malla * 1000.0
+
+        ax.plot(t_ms, self._anim_angulo, color=COLOR_ACCENT, linewidth=2, zorder=3)
+        ax.axhline(0, color="#999999", linewidth=1, linestyle="--", zorder=1)
+        ax.axhline(r.angulo_inicial_usado_grados, color=COLOR_CRUDO,
+                   linewidth=1, linestyle="--", zorder=1)
+        ax.axhline(r.angulo_final_usado_grados, color=COLOR_VELOCIDAD,
+                   linewidth=1, linestyle="--", zorder=1)
+        ax.text(t_ms[0], r.angulo_inicial_usado_grados, " liberación",
+                fontsize=8, color="gray", va="bottom")
+        ax.text(t_ms[0], r.angulo_final_usado_grados, " rebote",
+                fontsize=8, color=COLOR_VELOCIDAD, va="top")
+
+        self._anim_cursor = ax.axvline(t_ms[0], color="#E67E22", linewidth=1.5, zorder=4)
+        self._anim_punto, = ax.plot(
+            [t_ms[0]], [self._anim_angulo[0]], marker="o", markersize=7,
+            color="#E67E22", linestyle="none", zorder=5,
+        )
+
+        ax.set_xlabel("Tiempo (ms)")
+        ax.set_ylabel("Ángulo (°)")
+        ax.set_title("Ángulo vs. tiempo (cursor sincronizado)", fontsize=11)
+        ax.grid(alpha=0.25)
+        if not r.rebote_confiable:
+            ax.text(0.02, 0.02, "⚠ rebote estimado, no confirmado",
+                    transform=ax.transAxes, fontsize=9, color=COLOR_AVISO,
+                    va="bottom", ha="left")
+
+    # ----------------------------------------------------------------
+    # Dibujo cuadro a cuadro
+    # ----------------------------------------------------------------
+    def _dibujar_frame_anim(self):
+        """Ubica el péndulo y el cursor en el instante self._anim_t."""
+        if self._anim_t_malla is None:
+            return
+
+        t = self._anim_t
+        ang = float(np.interp(t, self._anim_t_malla, self._anim_angulo))
+        vel_rad = float(np.interp(t, self._anim_t_malla, self._anim_vel_rad))
+        rad = math.radians(ang)
+
+        # Varilla: del pivote (0,0) al extremo.
+        dx, dy = math.sin(rad), -math.cos(rad)      # dirección de la varilla
+        px, py = math.cos(rad), math.sin(rad)       # perpendicular
+        x, y = L_VARILLA * dx, L_VARILLA * dy
+        self._anim_varilla.set_data([0.0, x], [0.0, y])
+
+        # Martillo: rectángulo perpendicular al extremo de la varilla.
+        cx, cy = (L_VARILLA + 0.06) * dx, (L_VARILLA + 0.06) * dy
+        largo, espesor = 0.17, 0.075
+        self._anim_martillo.set_xy([
+            (cx + largo * px + espesor * dx, cy + largo * py + espesor * dy),
+            (cx + largo * px - espesor * dx, cy + largo * py - espesor * dy),
+            (cx - largo * px - espesor * dx, cy - largo * py - espesor * dy),
+            (cx - largo * px + espesor * dx, cy - largo * py + espesor * dy),
+        ])
+
+        # Destello de la probeta al cruzar el punto más bajo (impacto).
+        if self._anim_theta_prev is not None and self._anim_theta_prev * ang < 0.0:
+            self._anim_flash = 6
+        self._anim_theta_prev = ang
+        if self._anim_flash > 0:
+            self._anim_flash -= 1
+            self._anim_probeta.set_facecolor(COLOR_ACELERACION)
+        else:
+            self._anim_probeta.set_facecolor("#8a8a8a")
+
+        # Cursor sincronizado sobre la curva de ángulo.
+        t_ms = t * 1000.0
+        self._anim_cursor.set_xdata([t_ms, t_ms])
+        self._anim_punto.set_data([t_ms], [ang])
+
+        self.ax_pend.set_title(f"t = {t_ms:6.0f} ms     θ = {ang:7.2f}°", fontsize=11)
+        self.lbl_anim_info.configure(
+            text=f"t = {t_ms:.0f} ms   θ = {ang:.2f}°   ω = {math.degrees(vel_rad):.1f} °/s"
+        )
+        self.canvas_anim.draw_idle()
+
+    # ----------------------------------------------------------------
+    # Controles de reproducción
+    # ----------------------------------------------------------------
+    def _anim_toggle(self):
+        if self._anim_t_malla is None:
+            return
+        if self._anim_playing:
+            self._anim_pausar()
+            return
+
+        # Si el playback ya había terminado, vuelve a empezar.
+        if self._anim_t >= self._anim_t_fin - 1e-9:
+            self._anim_t = float(self._anim_t_malla[0])
+            self._anim_theta_prev = None
+            self._dibujar_frame_anim()
+
+        self._anim_playing = True
+        self._anim_gen += 1
+        self.btn_anim_play.configure(text="⏸  Pausar")
+        self._anim_tick(self._anim_gen)
+
+    def _anim_pausar(self):
+        """Corta el temporizador e invalida cualquier tick pendiente. Es el
+        único punto de parada: se usa al pausar, al recalcular, al cambiar de
+        pestaña y al cerrar la ventana."""
+        self._anim_playing = False
+        self._anim_gen += 1
+        if self._anim_after_id is not None:
+            try:
+                self.after_cancel(self._anim_after_id)
+            except Exception:
+                pass
+            self._anim_after_id = None
+        try:
+            self.btn_anim_play.configure(text="▶  Reproducir")
+        except Exception:
+            pass  # la ventana ya se está destruyendo
+
+    def _anim_reiniciar(self):
+        if self._anim_t_malla is None:
+            return
+        seguia = self._anim_playing
+        self._anim_pausar()
+        self._anim_t = float(self._anim_t_malla[0])
+        self._anim_theta_prev = None
+        self._anim_flash = 0
+        self._dibujar_frame_anim()
+        if seguia:
+            self._anim_toggle()
+
+    def _anim_cambiar_velocidad(self, valor):
+        self._anim_velocidad = VELOCIDADES_ANIMACION.get(valor, 0.25)
+
+    def _anim_tick(self, gen):
+        """Un cuadro del playback. gen protege contra ticks de animaciones ya
+        canceladas (pausa, nuevo cálculo, cambio de pestaña)."""
+        if gen != self._anim_gen or not self._anim_playing:
+            return
+
+        paso = self._anim_velocidad / FPS_ANIMACION   # segundos de dato por cuadro
+        if self._anim_t + paso >= self._anim_t_fin:
+            self._anim_t = self._anim_t_fin
+            self._dibujar_frame_anim()
+            self._anim_pausar()                       # terminó solo
+            return
+
+        self._anim_t += paso
+        self._dibujar_frame_anim()
+        self._anim_after_id = self.after(
+            int(1000 / FPS_ANIMACION), lambda: self._anim_tick(gen)
+        )
+
+    def _anim_limpiar(self):
+        """Vuelve al estado 'sin datos' (al cargar un archivo nuevo)."""
+        self._anim_pausar()
+        self._anim_t_malla = None
+        self._anim_angulo = None
+        self._anim_vel_rad = None
+        self._anim_placeholder()
+        self.btn_anim_play.configure(state="disabled")
+        self.btn_anim_reset.configure(state="disabled")
+
+    def destroy(self):
+        # Un 'after' pendiente debe morir antes que los widgets.
+        self._anim_pausar()
+        super().destroy()
 
     # ================================================================
     # EXPORTACION (delega el trabajo real en exporter.py)

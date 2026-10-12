@@ -48,6 +48,7 @@ Desktop application for analysing data from a home-built **Charpy impact test pe
 - **Moment of inertia** entered manually or estimated from the small-amplitude oscillation period.
 - **Encoder glitch rejection** and optional **Savitzky–Golay** pre-smoothing.
 - **Reliability flag**: the app warns when the rebound angle had to be estimated from a truncated capture.
+- **Pendulum animation**: a playback tab replays the reconstructed swing frame by frame, in slow motion, with the angle curve and a synced cursor.
 - **Exports**: PDF report, JPG plots and a tab-separated table of processed data.
 
 ## How it works
@@ -299,7 +300,7 @@ flowchart TD
 |---|---|
 | `main.py` | Entry point. Checks that the required packages and `tkinter` are available and prints installation hints instead of a traceback, then launches the GUI. |
 | `engine.py` | File parser and physics engine. No GUI dependencies; can be used as a library or from the command line. |
-| `gui.py` | `CharpyApp` window: file loading, parameter entry, result display and four static plot tabs. Contains no physics. |
+| `gui.py` | `CharpyApp` window: file loading, parameter entry, result display, four static plot tabs and a pendulum animation tab. Contains no physics: the animation only replays the spline already computed by `engine.py`. |
 | `exporter.py` | PDF report (ReportLab), JPG plots and processed-data TXT. Independent of the GUI. |
 | `requirements.txt` | Python dependencies. |
 | `charpy_final_1/charpy_final_1.ino` | Arduino Uno firmware that acquires the data. See [Hardware and firmware](#hardware-and-firmware). |
@@ -453,10 +454,14 @@ The interface labels are in Spanish; the English equivalents are given below.
 3. **Momento de inercia** (*Moment of inertia*), optional: choose **Manual** to enter $`I`$ in kg·m², or **Por período** to enter the oscillation period in seconds and have it computed. Without it, only the potential energy is plotted.
 4. **Corrección por fricción** (*Friction correction*): friction loss in joules, subtracted from the gross absorbed energy.
 5. **Suavizado** (*Smoothing*), optional: Savitzky–Golay window, an odd integer of 5 or more. Leave it empty for a pure cubic spline.
-6. **Calcular** (*Compute*): shows the angles used and the gross and net absorbed energy, and fills the four tabs: **Ángulo**, **Velocidad**, **Aceleración** and **Energía y potencia**.
+6. **Calcular** (*Compute*): shows the angles used and the gross and net absorbed energy, and fills the five tabs: **Ángulo**, **Velocidad**, **Aceleración**, **Energía y potencia** and **Animación**.
 7. **Exportar resultados...** (*Export results*): PDF report, JPG plots or processed-data TXT.
 
 An amber warning appears when the rebound angle could not be confirmed from the data.
+
+### Pendulum animation
+
+The **Animación** tab replays the test: the pendulum arm, hammer and specimen are drawn on the left, alongside the angle-vs-time curve with a cursor that tracks the playback. **▶ Reproducir** / **⏸ Pausar** start and pause it, **↺ Reiniciar** returns to the release instant, and the **Velocidad** menu sets a slow-motion factor (`1x` is real time). When the swing reaches the lowest point, the specimen flashes to mark the impact. The specimen is a schematic reference: the animation shows the spline's angle, not a rigid-body simulation, so the hammer is drawn passing through the specimen rather than deforming it.
 
 ### Command line
 
